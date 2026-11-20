@@ -7,6 +7,7 @@ never touch the network (conftest.py blocks it): every request goes through
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
@@ -25,13 +26,13 @@ from app import (
     OutsideLondon,
     PlaceNotFound,
     TflUnavailable,
+    Unexpected,
     base_risk,
     raise_risk,
 )
 
 NOW = datetime(2026, 11, 20, 15, 10, tzinfo=timezone.utc)
 FRESH = "2026-11-20T15:07:23.17Z"        # TfL's real timestamp format
-OLD = "2026-11-20T14:40:00Z"             # 30 minutes before NOW
 
 # South Kensington, SW7 2AZ (real postcodes.io coordinates).
 DEST = (51.499334, -0.179178)
@@ -259,19 +260,24 @@ def test_locked_docks_are_skipped():
     assert "Locked" not in json.dumps(data, default=str)
 
 
-def test_old_data_is_flagged_as_possibly_stale():
-    docks = bikepoint(dock("Roomy", 200, 9, 20, modified=OLD), dock("B", 300, 9, 20),
-                      dock("C", 400, 9, 20))
-    data = run({"destination": "SW7 2AZ"}, [SW7, ("BikePoint", docks)])[0].data
-    assert data["data_possibly_stale"] is True
-    assert data["data_updated"] == datetime(2026, 11, 20, 14, 40, tzinfo=timezone.utc)
-    assert "over 15 minutes old" in data["note"]
+def test_every_answer_is_plain_json():
+    """Pippa sends the answer on as JSON. A datetime or other object in
+    `data` passes the runner here and then crashes the live call ("That app
+    stopped unexpectedly"), which is what version 0.2.0 did."""
+    origin = (DEST[0] - 1000 / M_PER_DEG_LAT, DEST[1])
+    rules = [SW7, ("postcodes/SW1", postcode(*origin)), ("BikePoint", NEARBY)]
+    for inputs in ({"destination": "SW7 2AZ"},
+                   {"destination": "SW7 2AZ", "origin": "SW1A 1AA"}):
+        result = run(inputs, rules)[0]
+        json.dumps(result.data)
+        assert all(isinstance(v, (str, int, float, bool)) for v in result.data.values())
+        assert isinstance(result.narrative, str)
 
 
-def test_fresh_data_is_not_flagged():
+def test_the_note_gives_the_time_and_no_stale_warning():
     data = run({"destination": "SW7 2AZ"}, [SW7, ("BikePoint", NEARBY)])[0].data
-    assert data["data_possibly_stale"] is False
-    assert data["data_updated"].utcoffset() is not None
+    assert "checked at 15:10 London time" in data["note"]
+    assert "stale" not in json.dumps(data) and "15 minutes" not in data["note"]
 
 
 def test_the_real_tfl_record_is_read_correctly():
@@ -392,6 +398,9 @@ def test_all_nearby_full_names_the_nearest_dock_with_space():
     http_error("https://api.tfl.gov.uk/BikePoint", 500),
     TimeoutError("timed out"),
     urllib.error.URLError("no route"),
+    http_error("https://api.tfl.gov.uk/BikePoint", 403),
+    http.client.IncompleteRead(b"{\"places\": ["),   # connection cut mid-answer
+    ConnectionResetError("reset"),
     b"not json",
     b"{}",                                 # 200 with no places at all
     b"[]",
@@ -404,8 +413,11 @@ def test_tfl_failures_say_try_again_shortly(answer):
 
 
 @pytest.mark.parametrize("answer", [
+    http_error("https://nominatim.openstreetmap.org", 403),
     http_error("https://nominatim.openstreetmap.org", 429),
     TimeoutError("timed out"),
+    http.client.RemoteDisconnected("closed"),
+    b"<html>blocked</html>",
 ])
 def test_lookup_failures_say_try_again_shortly(answer):
     with pytest.raises(LookupUnavailable) as failure:
@@ -416,3 +428,25 @@ def test_lookup_failures_say_try_again_shortly(answer):
 def test_postcode_lookup_timeout_is_caught():
     with pytest.raises(LookupUnavailable):
         run({"destination": "SW7 2AZ"}, [("postcodes", TimeoutError("slow"))])
+
+
+def test_the_second_nominatim_lookup_waits_a_second():
+    """Nominatim allows one request a second; the London check is the second."""
+    waits = []
+    instance = App()
+    instance._fetch = Fake([
+        ("bounded=0", nominatim("London King's Cross", *DEST)),
+        ("nominatim", nominatim("Kings Cross", 51.7854, -0.9269, rank=25)),
+        ("BikePoint", NEARBY),
+    ])
+    instance._sleep = waits.append
+    LocalRunner(instance).call("dock.recommend", {"destination": "kings cross"},
+                               granted_secrets={}, now=NOW, request_id="t1")
+    assert len(waits) == 1 and 0 < waits[0] <= 1.0
+
+
+def test_an_unexpected_bug_becomes_a_sentence_not_a_crash(monkeypatch):
+    monkeypatch.setattr(app_module, "score", lambda dock, origin: 1 / 0)
+    with pytest.raises(Unexpected) as failure:
+        run({"destination": "SW7 2AZ"}, [SW7, ("BikePoint", NEARBY)])
+    assert "try again" in failure.value.user_message

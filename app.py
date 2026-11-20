@@ -19,6 +19,7 @@ Every request goes through `_fetch`, so the tests can replace the network.
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import re
@@ -26,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -60,16 +61,17 @@ ROUTE_FACTOR = 1.3            # straight line -> real streets
 RIDE_M_PER_MIN = 250
 WALK_M_PER_MIN = 80
 LONG_RIDE_MIN = 15            # a ride this long raises the risk one level
-STALE_AFTER = timedelta(minutes=15)
 
 RISK_ORDER = ["low", "medium", "high"]
 RISK_PENALTY_MIN = {"low": 0, "medium": 3, "high": 8}
 
 # Nominatim's usage policy: at most one request a second.
 NOMINATIM_GAP_S = 1.0
-# Leave headroom under Pippa's 20-second limit.
-TIME_BUDGET_S = 16.0
-FETCH_TIMEOUT_S = 5.0
+# Every request together must finish well inside Pippa's 20-second limit.
+# The worst case is four Nominatim lookups (two places, each possibly checked
+# twice, a second apart) plus two TfL requests.
+TIME_BUDGET_S = 14.0
+FETCH_TIMEOUT_S = 4.0
 
 FULL_POSTCODE = re.compile(r"^[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2}$")
 OUTCODE = re.compile(r"^[A-Z]{1,2}[0-9][A-Z0-9]?$")
@@ -113,6 +115,13 @@ class TflUnavailable(AgentAppError):
     retryable = True
 
 
+class Unexpected(AgentAppError):
+    user_message = (
+        "Something went wrong working out the best dock. Please try again shortly."
+    )
+    retryable = True
+
+
 class LookupUnavailable(AgentAppError):
     user_message = (
         "The place lookup service isn't responding right now. "
@@ -143,7 +152,6 @@ class Dock:
     lon: float
     empty: int
     total: int
-    updated: datetime | None
     distance_m: float = 0.0          # straight line, dock -> destination
 
 
@@ -198,16 +206,6 @@ def whole(x: float) -> int:
 
 def _normalise(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split())
-
-
-def _parse_time(text: str) -> datetime | None:
-    try:
-        moment = datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment
 
 
 def _to_int(value) -> int | None:
@@ -297,12 +295,16 @@ class App:
             raise unavailable(f"upstream answered {exc.code}")
         except TimeoutError as exc:                    # not a URLError
             raise unavailable(f"timed out: {exc}")
-        except (urllib.error.URLError, OSError) as exc:
-            raise unavailable(f"could not connect: {exc}")
+        except (urllib.error.URLError, OSError) as exc:   # DNS, refused, TLS
+            raise unavailable(f"could not connect: {type(exc).__name__}: {exc}")
+        except (http.client.HTTPException, ValueError) as exc:
+            # A connection cut mid-answer (IncompleteRead, BadStatusLine) is
+            # neither a URLError nor an OSError.
+            raise unavailable(f"broken response: {type(exc).__name__}: {exc}")
         try:
             return json.loads(raw)
-        except (ValueError, TypeError) as exc:
-            raise unavailable(f"response was not JSON: {exc}")
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise unavailable(f"response was not JSON: {type(exc).__name__}")
 
     # ── handle ────────────────────────────────────────────────────────────
 
@@ -310,6 +312,17 @@ class App:
         if call.outcome_id != "dock.recommend":
             raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
         self._started = self._clock()
+        self._last_nominatim = None
+        try:
+            return self._recommend(call)
+        except AgentAppError:
+            raise
+        except Exception as exc:
+            # A bug or a reply shaped in a way nobody expected. Say something
+            # true rather than letting the call die with no explanation.
+            raise Unexpected(f"{type(exc).__name__}: {exc}") from exc
+
+    def _recommend(self, call: Call) -> Result:
         now: datetime = call.context.now
 
         destination_text = " ".join((call.inputs.get("destination") or "").split())
@@ -355,7 +368,6 @@ class App:
 
         best, backups = usable[0], usable[1:3]
         nearest = min(scored, key=lambda s: s.dock.distance_m)
-        shown = [best, *backups, nearest]
 
         data: dict = {}
         self._put(data, "recommended", best)
@@ -374,18 +386,12 @@ class App:
             data["nearest_walk_min_closer"] = max(0, best.walk_min - nearest.walk_min)
             data["nearest_why_not"] = why_not(nearest, best)
 
-        times = [s.dock.updated for s in shown if s.dock.updated is not None]
-        oldest = min(times) if times else now
-        stale = (not times) or any(now - t > STALE_AFTER for t in times)
-        data["data_updated"] = oldest.astimezone(timezone.utc)
-        data["data_possibly_stale"] = stale
-
+        # Every value in `data` is a plain string, number or boolean, so the
+        # answer always turns into JSON cleanly.
         note = (
-            f"Live TfL dock data from {self._clock_time(oldest)}; "
+            f"Live TfL dock data checked at {self._clock_time(now)}; "
             "spaces can change before you arrive."
         )
-        if stale:
-            note += " Some of these figures are over 15 minutes old, so they may be out of date."
         if data["nearest_is_recommended"]:
             note += " The recommended dock is also the closest one to your destination."
         for extra in notes:
@@ -517,12 +523,9 @@ class App:
         if not isinstance(item, dict):
             return None
         props: dict = {}
-        updated: datetime | None = None
         for prop in item.get("additionalProperties") or []:
             if isinstance(prop, dict) and "key" in prop:
                 props[prop["key"]] = prop.get("value")
-                if prop["key"] == "NbEmptyDocks":
-                    updated = _parse_time(prop.get("modified"))
         # A dock that is locked or not installed cannot take a bike.
         if str(props.get("Installed", "true")).lower() != "true":
             return None
@@ -536,7 +539,7 @@ class App:
         if empty is None or total is None:
             return None
         name = str(item.get("commonName") or "Unnamed dock")
-        return Dock(name, lat, lon, max(0, empty), total, updated,
+        return Dock(name, lat, lon, max(0, empty), total,
                     haversine_m(place.lat, place.lon, lat, lon))
 
     def _all_full(self, destination: Place, text: str) -> AgentAppError:

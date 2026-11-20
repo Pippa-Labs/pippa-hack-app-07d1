@@ -14,12 +14,15 @@ app:
   id: hack.app_07d1
   name: Cycle Hire Dock Recommendation
   # Bump this before pushing again once a version is submitted for review.
-  version: 0.2.0
+  version: 0.3.0
   # Never use the word "by" here: the badge is parsed on it.
+  # Pippa's chooser reads only the first sentence, clipped to about 110
+  # characters, so it says exactly what the app answers.
   summary: >-
-    Recommends the best Santander Cycles dock to end your ride in London,
-    using live free spaces, ride time and walking time. It looks up places
-    with postcodes.io and OpenStreetMap, and docks with TfL.
+    Finds the Santander Cycles dock with free spaces to return a hire bike
+    near a London place or postcode. Ranks docks on live TfL free
+    spaces, ride time and walking time; places come from postcodes.io and
+    OpenStreetMap.
 
 agent_types:
   - personal
@@ -27,18 +30,20 @@ agent_types:
 outcomes:
   - id: dock.recommend
     summary: >-
-      Pick the best Santander Cycles docking station to return a bike near a
-      London destination, from live free spaces, ride and walking time
+      Which Santander Cycles dock to return or leave a hire bike at near a
+      London place, from live free spaces, ride and walking time
     # Only the first four reach Pippa's first decision, so the clearest come first.
     example_phrases:
+      - where should i dock my santander bike near
+      - where can i return a boris bike near
+      - free spaces at santander cycle docks near
+      - cycling from imperial to oxford circus where to dock
       - where should i dock my bike near south kensington
       - santander bike space near kings cross
-      - where can i return a boris bike near waterloo
-      - cycling from imperial to oxford circus where to dock
       - free cycle hire docks near sw7 2az
       - where to leave my santander bike near liverpool street
-      - docking station with free spaces near
-      - best place to drop off a santander cycle
+      - which docking station has space for my bike
+      - best place to drop off a hire bike
     inputs:
       # Optional on purpose: a missing required input is refused before the
       # app runs, with a message blaming the app. The app says what to type.
@@ -169,14 +174,8 @@ outcomes:
         type: string
         required: false
         description: Why the nearest dock was not recommended, for example "only 1 free space, high risk".
-      - name: data_updated
-        type: datetime
-        description: When TfL last updated the oldest dock figure shown here (UTC).
-      - name: data_possibly_stale
-        type: boolean
-        description: True when any dock figure shown is more than 15 minutes old.
       - name: note
         type: string
         description: >-
-          When the live data is from, that spaces can change before arrival,
-          and any other caveat (no starting point given, stale data).
+          When the live TfL data was checked, that spaces can change before
+          arrival, and any other caveat (for example, no starting point given).
